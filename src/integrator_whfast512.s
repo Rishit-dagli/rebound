@@ -294,11 +294,15 @@
     halley
     #mm_stiefel_Gs03_avx512
     #halley
-   
-.NewtonLoop\grflag:    
+
+    # Newton iter counter. Without a cap the loop spins forever on
+    # initial conditions where the Stumpff series cannot converge to
+    # the eps tolerance. Cap at 32.
+    xorl    %r10d, %r10d
+.NewtonLoop\grflag:
     vmovapd         XX,     %zmm9
     mm_stiefel_Gs13_avx512
-    newton 
+    newton
 
     vsubpd      XX, %zmm9, %zmm9  # Delta XX
     vpandq      %zmm10, %zmm9, %zmm9  # abs(Delta XX)
@@ -306,7 +310,12 @@
     vcmppd     $25, %zmm11, %zmm9, %k2         # abs(Delta XX) < eps    25 = Not greater or equal, unordered (nans pass), quiet
     kmovb   %k2, %eax
     cmpb    $0xFF, %al
-    jne .NewtonLoop\grflag
+    je      .NewtonDone\grflag                 # all lanes converged
+    incb    %r10b
+    cmpb    $32, %r10b
+    jne     .NewtonLoop\grflag                 # not yet at cap, keep iterating
+    # fall through: max iterations reached, accept current XX
+.NewtonDone\grflag:
 
     mm_stiefel_Gs13_avx512
     # PYTHON REPLACE STOP
