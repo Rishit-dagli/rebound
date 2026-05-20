@@ -285,9 +285,25 @@
     vmulpd          RI, DT, %zmm5               # dt/r
     vmulpd          ETA, %zmm5, %zmm4           # eta*dt/r
     vpsubq          HALF_MASK, %zmm4, %zmm4     # 0.5*eta*dt/r  (Note: integer sub trick)
-    vfnmadd132pd    RI, ONE, %zmm4        
+    vfnmadd132pd    RI, ONE, %zmm4
     vmulpd          %zmm5, %zmm4, XX            # X (second order initial guess)
-   
+
+    # Momentum guess
+    .if \grflag != 2
+        vmovapd         .X_prev(%rip), %zmm6
+        vxorpd          %zmm7, %zmm7, %zmm7
+        vcmppd          $4, %zmm7, %zmm6, %k2
+        kmovb           %k2, %eax
+        cmpb            $0xFF, %al
+        jne             .SkipMomentum\grflag
+
+        # all 8 lanes have valid history
+        vmovapd         .X_prev2(%rip), %zmm8
+        vaddpd          %zmm6, %zmm6, %zmm7
+        vsubpd          %zmm8, %zmm7, XX
+    .SkipMomentum\grflag:
+    .endif
+
     # Iterations to improve X
     # PYTHON REPLACE START
     mm_stiefel_Gs03_avx512
@@ -295,9 +311,7 @@
     #mm_stiefel_Gs03_avx512
     #halley
 
-    # Newton iter counter. Without a cap the loop spins forever on
-    # initial conditions where the Stumpff series cannot converge to
-    # the eps tolerance. Cap at 32.
+    # Newton iter counter. Cap at 32.
     xorl    %r10d, %r10d
 .NewtonLoop\grflag:
     vmovapd         XX,     %zmm9
@@ -310,12 +324,18 @@
     vcmppd     $25, %zmm11, %zmm9, %k2         # abs(Delta XX) < eps    25 = Not greater or equal, unordered (nans pass), quiet
     kmovb   %k2, %eax
     cmpb    $0xFF, %al
-    je      .NewtonDone\grflag                 # all lanes converged
+    je      .NewtonDone\grflag
     incb    %r10b
     cmpb    $32, %r10b
-    jne     .NewtonLoop\grflag                 # not yet at cap, keep iterating
-    # fall through: max iterations reached, accept current XX
+    jne     .NewtonLoop\grflag
 .NewtonDone\grflag:
+
+    # history update for the next step's momentum guess
+    .if \grflag != 2
+        vmovapd         .X_prev(%rip), %zmm9
+        vmovapd         %zmm9, .X_prev2(%rip)
+        vmovapd         XX, .X_prev(%rip)
+    .endif
 
     mm_stiefel_Gs13_avx512
     # PYTHON REPLACE STOP
@@ -361,20 +381,15 @@
 # Interaction Step
 ###############################################################################
 .macro interaction_step grflag
-    # TODO: Floating point error accumulation might be less if Jacobi and GR are added after P-P perturbations
-    # Add Jacobi term in Jacobi coordinates
-    vmulpd      X, X, %zmm4     
-    vfmadd231pd Y, Y, %zmm4      
+    # compute the Jacobi-correction prefactor but defer its application until the end of the step
+    vmulpd      X, X, %zmm4
+    vfmadd231pd Y, Y, %zmm4
     vfmadd231pd Z, Z, %zmm4             # r^2
-    vsqrtpd     %zmm4, %zmm5            # r 
+    vsqrtpd     %zmm4, %zmm5            # r
     vmulpd      %zmm4, %zmm5, %zmm4     # r^3
-  
-    vdivpd      %zmm4, M_DT, %zmm6  # M*dt/r^3 (where M=(m0, m0+m1, m0+m1+m2,...)
-    
-    vfmadd231pd     X, %zmm6, VX{%k1}{z} 
-    vfmadd231pd     Y, %zmm6, VY{%k1}{z} 
-    vfmadd231pd     Z, %zmm6, VZ{%k1}{z} 
-    
+    vdivpd      %zmm4, M_DT, %zmm6
+    vmovupd     %zmm6, 192(%rsp) # stash for end-of-step
+
     leaq P512_MAT8_JACOBI_TO_HELIOCENTRIC(%rdi), %rax  # mat8_inertial_to_jacobi
     mat8_mul3 X, Y, Z, HX, HY, HZ
     
@@ -558,13 +573,19 @@
    
     mat8_mul3 %zmm0, %zmm1, %zmm2, %zmm0, %zmm1, %zmm2
 
+    # combine (M*dt/r^3) * x_jac (stashed at 192(%rsp)) with the pairwise delta-v in one FMA per axis before adding to VX/VY/VZ.
+    vmovupd     192(%rsp), %zmm3
+    vfmadd231pd X, %zmm3, %zmm0
+    vfmadd231pd Y, %zmm3, %zmm1
+    vfmadd231pd Z, %zmm3, %zmm2
+
     # Update velocities
     # This could be combined with mat8_mul3.
     # However, that would increase floating point errors because sum(DVX) << VX
-    vaddpd    VX, %zmm0, VX        
+    vaddpd    VX, %zmm0, VX
     vaddpd    VY, %zmm1, VY
     vaddpd    VZ, %zmm2, VZ
-.endm 
+.endm
 
 ###############################################################################
 # Global functions
@@ -590,11 +611,16 @@ reb_whfast512_kepler_step:
 
     # Load constants
     reb_whfast512_init_registers
-    # Allocate space on stack for matrix multiplications
-    subq    $192, %rsp
+    #Aallocate space on stack for matrix multiplications
+    subq    $256, %rsp
+
+    # reset momentum-guess history at the start of every BLOCK1 call
+    vxorpd      %zmm0, %zmm0, %zmm0
+    vmovapd     %zmm0, .X_prev(%rip)
+    vmovapd     %zmm0, .X_prev2(%rip)
 
     # Main loop
-.LMainLoop\grflag:    
+.LMainLoop\grflag:
     kepler_step \grflag
     interaction_step \grflag
     subq    $1, %rsi
@@ -608,7 +634,7 @@ reb_whfast512_kepler_step:
     vmovapd    Y, P512_Y(%rdi)
     vmovapd    Z, P512_Z(%rdi)
 
-    addq    $192, %rsp
+    addq    $256, %rsp
     ret
 .endm
 
@@ -726,5 +752,13 @@ b34mergeidx:
     .long    943953938
     .long    834731386
     .long    938635522
+
+
+.section .bss
+.align 64
+.X_prev:
+    .zero 64
+.X_prev2:
+    .zero 64
 
 .section .note.GNU-stack,"",@progbits
