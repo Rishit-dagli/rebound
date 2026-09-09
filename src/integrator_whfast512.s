@@ -229,7 +229,7 @@
     vxorpd          %zmm6, %zmm6, %zmm6          # cs2 lo = 0
     comp_horner_step %zmm3, %zmm5, 5
     comp_horner_step %zmm4, %zmm6, 4
-    comp_horner_step %zmm3, %zmm5, 3
+    comp_horner_step %zmm3, %zmm5, 3, 0          # omit 1/3! coefficient tail
     comp_horner_step %zmm4, %zmm6, 2, 0          # .IF0_err[2]==0
     vaddpd          %zmm5, %zmm3, %zmm3
     vaddpd          %zmm6, %zmm4, %zmm4
